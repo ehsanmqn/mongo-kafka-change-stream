@@ -1,0 +1,17 @@
+FROM mci.ir/mongo-to-kafka
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+ENV PYTHONUNBUFFERED=1 \
+    LOG_LEVEL=INFO \
+    RESUME_STORE_PATH=/data/resume_tokens.json
+
+RUN mkdir -p /data
+
+CMD ["python", "kafka_to_starrocks.py"]

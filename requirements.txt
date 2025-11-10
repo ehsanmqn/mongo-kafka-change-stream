@@ -1,0 +1,7 @@
+motor
+aiokafka
+pymongo
+pymysql
+orjson
+python-dotenv
+loguru
