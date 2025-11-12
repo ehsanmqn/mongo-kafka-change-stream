@@ -63,43 +63,52 @@ def get_starrocks_conn():
     )
 
 
-def flatten_row(row: dict) -> dict:
-    """Convert nested dicts/lists to JSON strings and normalize Mongo dates."""
-    flat = {}
-    for k, v in row.items():
-        if isinstance(v, dict) and "$date" in v:
-            # Convert Mongo date to StarRocks DATETIME string
-            flat[k] = v["$date"].replace("T", " ").replace("Z", "")
-        elif isinstance(v, (dict, list)):
-            # Serialize nested objects to JSON string
-            flat[k] = orjson.dumps(v).decode("utf-8")
-        else:
-            flat[k] = v
-    return flat
-
-
-def normalize_mongo_dates(row: dict) -> dict:
+def normalize_mongo_row(row: dict) -> dict:
     """
-    Normalize Mongo-style or ISO timestamps for StarRocks.
-    Converts {"$date": "..."} or strings like "2025-11-08T14:31:15.570034+00:00"
-    into 'YYYY-MM-DD HH:MM:SS'.
+    Normalize and flatten a MongoDB document for SQL/StarRocks compatibility:
+    - Converts {"$date": "..."} → 'YYYY-MM-DD HH:MM:SS'
+    - Converts {"$oid": "..."} → string
+    - Serializes nested dicts/lists to JSON
+    - Converts ISO-like datetime strings to SQL format
+    - Truncates long string values (>255 chars)
     """
+    MAX_LEN = 255
+
     def normalize_value(v):
-        if isinstance(v, dict) and "$date" in v:
-            v = v["$date"]
+        if isinstance(v, dict):
+            # Handle Mongo special cases
+            if "$date" in v:
+                v = v["$date"]
+                try:
+                    cleaned = v.replace("T", " ").replace("Z", "").split("+")[0].split(".")[0]
+                    dt = datetime.strptime(cleaned, "%Y-%m-%d %H:%M:%S")
+                    v = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+                return v[:MAX_LEN] if isinstance(v, str) and len(v) > MAX_LEN else v
 
-        if isinstance(v, str):
-            # Try parsing ISO-like strings
+            elif "$oid" in v:
+                v = v["$oid"]
+                return v[:MAX_LEN] if isinstance(v, str) and len(v) > MAX_LEN else v
+
+            else:
+                v = orjson.dumps(v).decode("utf-8")
+                return v[:MAX_LEN] if len(v) > MAX_LEN else v
+
+        elif isinstance(v, list):
+            v = orjson.dumps(v).decode("utf-8")
+            return v[:MAX_LEN] if len(v) > MAX_LEN else v
+
+        elif isinstance(v, str):
+            # Normalize ISO-like timestamps
             try:
-                # Strip Z or timezone part
                 cleaned = v.replace("T", " ").replace("Z", "").split("+")[0].split(".")[0]
-                # Ensure consistent format
                 dt = datetime.strptime(cleaned, "%Y-%m-%d %H:%M:%S")
-                return dt.strftime("%Y-%m-%d %H:%M:%S")
+                v = dt.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
-                return v  # leave as-is if not parseable
-        elif isinstance(v, (dict, list)):
-            return orjson.dumps(v).decode("utf-8")
+                pass
+            return v[:MAX_LEN] if len(v) > MAX_LEN else v
+
         else:
             return v
 
@@ -136,19 +145,17 @@ def ensure_columns_exist(conn, table_name: str, row: dict):
 
 
 def ensure_table_exists(conn, table_name: str, sample_row: dict):
-    """Create the table in StarRocks if it does not exist, using PRIMARY KEY and replication."""
+    """Create the table in StarRocks if it does not exist, using AUTO ID as primary key."""
     cursor = conn.cursor()
     cursor.execute("SHOW TABLES LIKE %s", (table_name,))
     if cursor.fetchone():
         cursor.close()
         return
 
-    primary_key = "_streamed_at"
-    columns = [f"`{primary_key}` DATETIME"]
+    # Add auto-incrementing primary key
+    columns = ["`id` BIGINT AUTO_INCREMENT"]
 
     for key, value in sample_row.items():
-        if key == primary_key:
-            continue
         if isinstance(value, bool) or isinstance(value, int):
             coltype = "BIGINT"
         elif isinstance(value, float):
@@ -167,8 +174,8 @@ def ensure_table_exists(conn, table_name: str, sample_row: dict):
     CREATE TABLE IF NOT EXISTS `{table_name}` (
       {cols_sql}
     )
-    PRIMARY KEY(`{primary_key}`)
-    DISTRIBUTED BY HASH(`{primary_key}`)
+    PRIMARY KEY(`id`)
+    DISTRIBUTED BY HASH(`id`)
     PROPERTIES("replication_num" = "2");
     """
 
@@ -249,8 +256,7 @@ async def consume_kafka():
             full_doc["_streamed_at"] = data.get("_streamed_at") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
             # Flatten nested dicts/lists and normalize dates
-            flat_doc = flatten_row(full_doc)
-            flat_doc = normalize_mongo_dates(flat_doc)
+            flat_doc = normalize_mongo_row(full_doc)
 
             # Convert MongoDB ObjectId JSON string to plain string
             if "_id" in flat_doc:
